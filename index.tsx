@@ -8,7 +8,7 @@ import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { Devs } from "@utils/constants";
 import definePlugin from "@utils/types";
 import { findByPropsLazy } from "@webpack";
-import { Menu, RestAPI, Toasts, UserStore } from "@webpack/common";
+import { ChannelStore, Menu, RestAPI, Toasts, UserStore } from "@webpack/common";
 
 const MessageActions = findByPropsLazy("deleteMessage", "startEditMessage");
 
@@ -20,6 +20,13 @@ interface ChannelContextProps {
     };
 }
 
+interface QueueItem {
+    channelId: string;
+    channelName: string;
+}
+
+// Kuyruk sistemi
+const queue: QueueItem[] = [];
 let isClearing = false;
 let shouldStop = false;
 
@@ -27,38 +34,63 @@ async function sleep(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function clearMessages(channelId: string) {
-    if (isClearing) {
-        shouldStop = true;
+function getChannelName(channelId: string): string {
+    const channel = ChannelStore.getChannel(channelId);
+    if (!channel) return "Bilinmeyen";
+
+    if (channel.type === 1) {
+        // DM - kullanıcı adını al
+        const recipient = channel.recipients?.[0];
+        if (recipient) {
+            const user = UserStore.getUser(recipient);
+            return user?.username || "DM";
+        }
+        return "DM";
+    }
+
+    return channel.name || "Grup DM";
+}
+
+async function processQueue() {
+    if (isClearing || queue.length === 0) return;
+
+    isClearing = true;
+
+    while (queue.length > 0 && !shouldStop) {
+        const item = queue[0];
+
         Toasts.show({
-            message: "Silme işlemi durduruluyor...",
+            message: `[${queue.length} sırada] ${item.channelName} siliniyor...`,
             type: Toasts.Type.MESSAGE,
             id: Toasts.genId()
         });
-        return;
+
+        await clearMessages(item.channelId, item.channelName);
+
+        queue.shift(); // İlk elemanı kaldır
     }
 
-    isClearing = true;
+    isClearing = false;
     shouldStop = false;
 
-    const currentUser = UserStore.getCurrentUser();
-    if (!currentUser) {
-        isClearing = false;
-        return;
+    if (queue.length === 0) {
+        Toasts.show({
+            message: "Tüm sıra tamamlandı!",
+            type: Toasts.Type.SUCCESS,
+            id: Toasts.genId()
+        });
     }
+}
 
-    Toasts.show({
-        message: "Mesajlar siliniyor... (Durdurmak için tekrar tıkla)",
-        type: Toasts.Type.MESSAGE,
-        id: Toasts.genId()
-    });
+async function clearMessages(channelId: string, channelName: string): Promise<void> {
+    const currentUser = UserStore.getCurrentUser();
+    if (!currentUser) return;
 
     let deletedCount = 0;
     let lastMessageId: string | undefined;
 
     try {
         while (!shouldStop) {
-            // Mesajları çek
             const url = lastMessageId
                 ? `/channels/${channelId}/messages?limit=100&before=${lastMessageId}`
                 : `/channels/${channelId}/messages?limit=100`;
@@ -68,18 +100,15 @@ async function clearMessages(channelId: string) {
 
             if (!messages || messages.length === 0) break;
 
-            // Sadece kendi mesajlarımızı filtrele
             const myMessages = messages.filter((m: any) => m.author.id === currentUser.id);
 
             if (myMessages.length === 0 && messages.length > 0) {
-                // Kendi mesajımız yok ama başka mesajlar var, devam et
                 lastMessageId = messages[messages.length - 1].id;
                 continue;
             }
 
             if (myMessages.length === 0) break;
 
-            // Mesajları sil
             for (const msg of myMessages) {
                 if (shouldStop) break;
 
@@ -89,17 +118,15 @@ async function clearMessages(channelId: string) {
 
                     if (deletedCount % 10 === 0) {
                         Toasts.show({
-                            message: `${deletedCount} mesaj silindi...`,
+                            message: `${channelName}: ${deletedCount} mesaj silindi... [${queue.length} sırada]`,
                             type: Toasts.Type.MESSAGE,
                             id: Toasts.genId()
                         });
                     }
 
-                    // Rate limit için bekle
                     await sleep(1100);
                 } catch (e: any) {
                     if (e?.status === 429) {
-                        // Rate limited, bekle
                         const retryAfter = e?.body?.retry_after || 5;
                         await sleep(retryAfter * 1000 + 500);
                     }
@@ -110,21 +137,55 @@ async function clearMessages(channelId: string) {
         }
 
         Toasts.show({
-            message: `Tamamlandı! ${deletedCount} mesaj silindi.`,
+            message: `${channelName}: ${deletedCount} mesaj silindi!`,
             type: Toasts.Type.SUCCESS,
             id: Toasts.genId()
         });
     } catch (e) {
         console.error("[ClearDM] Hata:", e);
         Toasts.show({
-            message: "Bir hata oluştu!",
+            message: `${channelName}: Hata oluştu!`,
             type: Toasts.Type.FAILURE,
             id: Toasts.genId()
         });
     }
+}
 
-    isClearing = false;
-    shouldStop = false;
+function addToQueue(channelId: string) {
+    // Zaten sırada mı kontrol et
+    if (queue.some(item => item.channelId === channelId)) {
+        Toasts.show({
+            message: "Bu kanal zaten sırada!",
+            type: Toasts.Type.FAILURE,
+            id: Toasts.genId()
+        });
+        return;
+    }
+
+    const channelName = getChannelName(channelId);
+    queue.push({ channelId, channelName });
+
+    Toasts.show({
+        message: `${channelName} sıraya eklendi! (Sıra: ${queue.length})`,
+        type: Toasts.Type.SUCCESS,
+        id: Toasts.genId()
+    });
+
+    // Eğer işlem çalışmıyorsa başlat
+    if (!isClearing) {
+        processQueue();
+    }
+}
+
+function stopAll() {
+    shouldStop = true;
+    queue.length = 0; // Sırayı temizle
+
+    Toasts.show({
+        message: "Tüm işlemler durduruluyor...",
+        type: Toasts.Type.MESSAGE,
+        id: Toasts.genId()
+    });
 }
 
 const ChannelContext: NavContextMenuPatchCallback = (children, { channel }: ChannelContextProps) => {
@@ -133,19 +194,32 @@ const ChannelContext: NavContextMenuPatchCallback = (children, { channel }: Chan
     // Sadece DM'lerde göster (type 1 = DM, type 3 = Group DM)
     if (channel.type !== 1 && channel.type !== 3) return;
 
+    const isInQueue = queue.some(item => item.channelId === channel.id);
+
     children.push(
-        <Menu.MenuItem
-            id="clear-dm"
-            label={isClearing ? "Silmeyi Durdur" : "Tüm Mesajlarımı Sil"}
-            color="danger"
-            action={() => clearMessages(channel.id)}
-        />
+        <Menu.MenuGroup>
+            <Menu.MenuItem
+                id="clear-dm-add"
+                label={isInQueue ? "Zaten Sırada" : "Sıraya Ekle"}
+                color="danger"
+                disabled={isInQueue}
+                action={() => addToQueue(channel.id)}
+            />
+            {(isClearing || queue.length > 0) && (
+                <Menu.MenuItem
+                    id="clear-dm-stop"
+                    label={`Tümünü Durdur (${queue.length} sırada)`}
+                    color="danger"
+                    action={() => stopAll()}
+                />
+            )}
+        </Menu.MenuGroup>
     );
 };
 
 export default definePlugin({
     name: "ClearDM",
-    description: "DM'deki tüm mesajlarını sil",
+    description: "DM'deki tüm mesajlarını sil (sıralama sistemi ile)",
     authors: [{ name: "verfired", id: 1362177941882142923n }],
 
     contextMenus: {
