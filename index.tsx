@@ -88,6 +88,8 @@ async function clearMessages(channelId: string, channelName: string): Promise<vo
 
     let deletedCount = 0;
     let lastMessageId: string | undefined;
+    const baseDelay = 300;
+    let delay = baseDelay;
 
     try {
         while (!shouldStop) {
@@ -95,56 +97,88 @@ async function clearMessages(channelId: string, channelName: string): Promise<vo
                 ? `/channels/${channelId}/messages?limit=100&before=${lastMessageId}`
                 : `/channels/${channelId}/messages?limit=100`;
 
-            const response = await RestAPI.get({ url });
-            const messages = response.body;
-
-            if (!messages || messages.length === 0) break;
-
-            const myMessages = messages.filter((m: any) => m.author.id === currentUser.id);
-
-            if (myMessages.length === 0 && messages.length > 0) {
-                lastMessageId = messages[messages.length - 1].id;
+            let response;
+            try {
+                response = await RestAPI.get({ url });
+            } catch (e: any) {
+                if (e?.status === 429) {
+                    const retryAfter = e?.body?.retry_after || 2;
+                    await sleep(retryAfter * 1000 + 300);
+                    continue;
+                }
+                console.error("[ClearDM] Fetch hatası:", e);
+                await sleep(2000);
                 continue;
             }
 
-            if (myMessages.length === 0) break;
+            const messages = response.body;
+
+            if (!messages || messages.length === 0) {
+                break;
+            }
+
+            const myMessages = messages.filter((m: any) => m.author.id === currentUser.id);
+
+            if (myMessages.length === 0) {
+                lastMessageId = messages[messages.length - 1].id;
+                await sleep(200);
+                continue;
+            }
 
             for (const msg of myMessages) {
                 if (shouldStop) break;
 
-                try {
-                    await RestAPI.del({ url: `/channels/${channelId}/messages/${msg.id}` });
-                    deletedCount++;
+                let success = false;
+                let retries = 0;
 
-                    if (deletedCount % 10 === 0) {
-                        Toasts.show({
-                            message: `${channelName}: ${deletedCount} mesaj silindi... [${queue.length} sırada]`,
-                            type: Toasts.Type.MESSAGE,
-                            id: Toasts.genId()
-                        });
-                    }
+                while (!success && retries < 3) {
+                    try {
+                        await RestAPI.del({ url: `/channels/${channelId}/messages/${msg.id}` });
+                        deletedCount++;
+                        success = true;
+                        
+                        delay = baseDelay;
 
-                    await sleep(1100);
-                } catch (e: any) {
-                    if (e?.status === 429) {
-                        const retryAfter = e?.body?.retry_after || 5;
-                        await sleep(retryAfter * 1000 + 500);
+                        if (deletedCount % 10 === 0) {
+                            Toasts.show({
+                                message: `${channelName}: ${deletedCount} mesaj silindi...`,
+                                type: Toasts.Type.MESSAGE,
+                                id: Toasts.genId()
+                            });
+                        }
+
+                        await sleep(delay);
+
+                    } catch (e: any) {
+                        if (e?.status === 429) {
+                            const retryAfter = e?.body?.retry_after || 2;
+                            await sleep(retryAfter * 1000 + 300);
+                            retries++;
+                        } else if (e?.status === 404) {
+                            success = true;
+                            delay = baseDelay;
+                        } else {
+                            console.error(`[ClearDM] Mesaj silme hatası ${msg.id}:`, e);
+                            retries++;
+                            await sleep(800);
+                        }
                     }
                 }
             }
 
             lastMessageId = messages[messages.length - 1].id;
+            await sleep(100);
         }
 
         Toasts.show({
-            message: `${channelName}: ${deletedCount} mesaj silindi!`,
+            message: `${channelName}: Toplam ${deletedCount} mesaj silindi!`,
             type: Toasts.Type.SUCCESS,
             id: Toasts.genId()
         });
     } catch (e) {
-        console.error("[ClearDM] Hata:", e);
+        console.error("[ClearDM] Kritik hata:", e);
         Toasts.show({
-            message: `${channelName}: Hata oluştu!`,
+            message: `${channelName}: Hata oluştu! ${deletedCount} mesaj silindi. Konsolu kontrol et.`,
             type: Toasts.Type.FAILURE,
             id: Toasts.genId()
         });
